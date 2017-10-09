@@ -1,8 +1,7 @@
-# MPI-Customizations
-This holds all the customised doorkeeper actions specific for MPI
-
 # MPIPersists
 DoorKeeper persist action for MPI archival storage organisation	
+Upload MPIPersists.java file to the location ../FLAT/docker/add-doorkeeper-to-flat/DoorKeeper/src/main/java/nl/mpi/tla/flat/deposit/action
+REPLACE/COMMENT existing Persist action part of file: ../FLAT/docker/add-doorkeeper-to-flat/flat/deposit/flat-deposit.xml with following action statement:
 
 <action name="persist resources" class="nl.mpi.tla.flat.deposit.action.MPIPersists">
 <parameter name="fedoraConfig" value="{$base}/policies/fedora-config.xml"/>
@@ -12,14 +11,3 @@ DoorKeeper persist action for MPI archival storage organisation
 <parameter name="archiveRootMapping" value="{$base}/policies/archive-roots-mapping.xml"/>
 </action>
 
-#MPIDelete
-DoorKeeper delete action for MPI archival storage organisation	
-(Place this after action FedoraInteract and before FedoraDelete)
-
-<action class="nl.mpi.tla.flat.deposit.action.MPIDelete">
-<parameter name="fedoraConfig" value="{$work}/acl/fedora-config.xml"/>
-</action>
-
-
-#MPIChecksum
-#TODO
