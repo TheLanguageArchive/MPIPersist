@@ -1,6 +1,10 @@
 # MPIPersists
 DoorKeeper persist action for MPI archival storage organisation	
-Upload MPIPersists.java file to the location ../FLAT/docker/add-doorkeeper-to-flat/DoorKeeper/src/main/java/nl/mpi/tla/flat/deposit/action
+How-to Build the code:
+Run the command in the checked out repo ../MPIPersist/MPIPersist: mvn clean install
+Place the MPIPersist-1.0-SNAPSHOT.jar in the docker path: /var/www/fedora/tomcat/webapps/flat/WEB-INF/lib
+restart tomcat: supervisorctl restart tomcat
+
 REPLACE/COMMENT existing Persist action part of file: ../FLAT/docker/add-doorkeeper-to-flat/flat/deposit/flat-deposit.xml with following action statement:
 
 <action name="persist resources" class="nl.mpi.tla.flat.deposit.action.MPIPersists">
