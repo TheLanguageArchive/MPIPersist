@@ -123,6 +123,8 @@ public class MPIPersists extends FedoraAction {
 				cols = col.getParentCollections();
 			}
 
+			path += "/";
+			
 			//Replace the fedora path with file system path based on archive-roots-mapping.xml
 			XdmNode nArchRootMap = Saxon.buildDocument(new StreamSource(archRootMap));
 			XdmNode mapping = (XdmNode) Saxon.xpathSingle(nArchRootMap,"//mapping[starts-with('"+path+"',sanitized-fedora-path)][1]");
@@ -136,7 +138,7 @@ public class MPIPersists extends FedoraAction {
 				logger.debug("Path after replacing: "+path);
 			}
 			else {
-				throw new DepositException("FAILED! Path: "+path+" is not specified in archive-toots-mapping.xml file");
+				throw new DepositException("FAILED! Path: "+path+" is not specified in archive-roots-mapping.xml file");
 			}
 
 			//path = resourcesDir + "/" + path;--  Not required anymore as the path is now determined based on the archive-roots-mapping.xml
@@ -180,42 +182,33 @@ public class MPIPersists extends FedoraAction {
 
 								mdsResponse = mds.versionable(false).execute();
 								if (mdsResponse.getStatus() != 200)
-									throw new DepositException("Unexpected status[" + mdsResponse.getStatus()
-											+ "] while interacting with Fedora Commons!");
+									throw new DepositException("Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
 
-								mdsResponse = mds.dsLocation("file:/" + oldFile.getPath()).logMessage("Updated " + dsid)
-										.execute();
+								mdsResponse = mds.dsLocation("file:/" + oldFile.getPath()).logMessage("Updated " + dsid).execute();
 								if (mdsResponse.getStatus() != 200)
-									throw new DepositException("Unexpected status[" + mdsResponse.getStatus()
-											+ "] while interacting with Fedora Commons!");
+									throw new DepositException("Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
 
 								mdsResponse = mds.versionable(true).execute();
 								if (mdsResponse.getStatus() != 200)
-									throw new DepositException("Unexpected status[" + mdsResponse.getStatus()
-											+ "] while interacting with Fedora Commons!");
+									throw new DepositException("Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
 
-								logger.debug("Updated FedoraObject[" + fid + "][" + dsid + "]["
-										+ mdsResponse.getLastModifiedDate() + "]");
+								logger.debug("Updated FedoraObject[" + fid + "][" + dsid + "]["+ mdsResponse.getLastModifiedDate() + "]");
 
 								// register the update of the PID for the old
 								// version of the resource
-								context.addPID(this.lookupPID(res.getFID(true)), new URI(
-										fid + "#OBJ@" + Global.asOfDateTime(mdsResponse.getLastModifiedDate())));
+								context.addPID(this.lookupPID(res.getFID(true)), new URI(fid + "#OBJ@" + Global.asOfDateTime(mdsResponse.getLastModifiedDate())));
 							} else {
-								throw new DepositException(
-										"FAILED! Failed to rename the resource with same name as new one while updating the resource!");
+								throw new DepositException("FAILED! Failed to rename the resource with same name as new one while updating the resource!");
 							}
 						} else {
-							throw new DepositException("File path [" + target + "] clash for Resource[" + res.getFile()
-									+ "] during update");
+							throw new DepositException("File path [" + target + "] clash for Resource[" + res.getFile()+ "] during update");
 						}
 					}
 					Files.move(res.getFile().toPath(), target.toPath());
-					res.setFile(target);
 					logger.debug("Moved file from :" + res.getFile().toPath() + " to: " + target.getPath());
+					res.setFile(target);
 				} else {
-					logger.debug(
-							"The res was neither for insert not for update. Persist action did not perform on any res!");
+					logger.debug("The res was neither for insert not for update. Persist action did not perform on any res!");
 				}
 			}
 
