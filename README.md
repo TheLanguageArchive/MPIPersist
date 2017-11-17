@@ -18,3 +18,10 @@ The standard persist action configuration in flat-deposit.xml needs to be replac
 <parameter name="archiveRootMapping" value="{$base}/policies/archive-roots-mapping.xml"/>
 </action>
 ```
+
+The MPIDelete action configuration in flat-deposit.xml needs to be placed with following lines before the action FedoraDelete (adapted for your local paths and CMDI profiles):
+```
+<action class="nl.mpi.tla.flat.deposit.action.MPIDelete">
+	<parameter name="fedoraConfig" value="{$work}/acl/fedora-config.xml"/>
+</action>
+```
