@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<archive-roots-mapping>
+    <mapping>
+        <sanitized-fedora-path>/The_Language_Archive/MPI_corpora/Language_and_Cognition/oceania/Papua_New_Guinnea/Kilivila/Senft/</sanitized-fedora-path>
+        <file-system-path>/mnt/vfs1/archive/archive-data/lac_data/senft/</file-system-path>
+    </mapping>
+    <mapping>
+        <sanitized-fedora-path>/The_Language_Archive/MPI_corpora/Language_and_Cognition/</sanitized-fedora-path>
+        <file-system-path>/mnt/vfs1/archive/archive-data/lac_data/</file-system-path>
+    </mapping>
+    <mapping>
+        <sanitized-fedora-path>/The_Language_Archive/MPI_corpora/Language_and_Genetics/DDP/</sanitized-fedora-path>
+        <file-system-path>/mnt/vfs1/archive/archive-data/lag_data/ddp/</file-system-path>
+    </mapping>
+    <mapping>
+        <sanitized-fedora-path>/The_Language_Archive/MPI_corpora/Language_and_Genetics/</sanitized-fedora-path>
+        <file-system-path>/mnt/vfs1/archive/archive-data/lag_data/</file-system-path>
+    </mapping>
+    <mapping>
+        <sanitized-fedora-path>/The_Language_Archive/DoBeS_Archive/</sanitized-fedora-path>
+        <file-system-path>/mnt/vfs1/archive/archive-data/dobes_data/</file-system-path>
+    </mapping>
+    <mapping>
+        <sanitized-fedora-path>/The_Language_Archive/</sanitized-fedora-path>
+        <file-system-path>/mnt/vfs1/archive/archive-data/</file-system-path>
+    </mapping>
+	<mapping>
+        <sanitized-fedora-path>Compound_Collection/hdl_12345_comic_collection/Pavithra/</sanitized-fedora-path>
+        <file-system-path>/app/flat/data/Compound_Collection/hdl_12345_comic_collection/pavithra</file-system-path>
+    </mapping>
+	<mapping>
+        <sanitized-fedora-path>Compound_Collection/hdl_12345_comic_collection/</sanitized-fedora-path>
+        <file-system-path>/app/flat/data/Compound_Collection/hdl_12345_comic_collection</file-system-path>
+    </mapping>
+	<mapping>
+        <sanitized-fedora-path>DvR_Sandbox/</sanitized-fedora-path>
+        <file-system-path>/app/flat/data/DvR_Sandbox</file-system-path>
+    </mapping>
+</archive-roots-mapping>
