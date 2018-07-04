@@ -213,7 +213,7 @@ public class MPIPersists extends FedoraAction {
     private String getCollectionPath(CMD sip) throws FedoraClientException, SaxonApiException, URISyntaxException, DepositException {
         String path = "";
         String pFid = null;
-        Set colls = sip.getCollections();
+        Set colls = sip.getCollections(false);
         if (colls.size()>1) {
             throw new DepositException("MPI doesn't do more than one parent collection!");
         } else if (!colls.isEmpty()) {
