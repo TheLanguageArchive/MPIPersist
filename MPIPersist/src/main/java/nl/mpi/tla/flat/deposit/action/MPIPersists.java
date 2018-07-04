@@ -103,7 +103,7 @@ public class MPIPersists extends FedoraAction {
             path = StringUtils.stripAccents(path);
             path = path.replaceAll("[^a-zA-Z0-9]", "_");
 
-            path = getCollectionPath(sip.getFID(true).toString()) + "/" + path;
+            path = getCollectionPath(sip) + "/" + path;
 
             path += "/";
 
@@ -209,6 +209,21 @@ public class MPIPersists extends FedoraAction {
         }
         return true;
     }
+    
+    private String getCollectionPath(CMD sip) throws FedoraClientException, SaxonApiException, URISyntaxException, DepositException {
+        String path = "";
+        String pFid = null;
+        Set colls = sip.getCollections();
+        if (colls.size()>1) {
+            throw new DepositException("MPI doesn't do more than one parent collection!");
+        } else if (!colls.isEmpty()) {
+            pFid = ((Collection)colls.iterator().next()).getFID(true).toString();
+        }
+        if (pFid != null) {
+            path = getCollectionPath(pFid) + "/" + getSanitizedCollectionLabel(pFid);
+        }
+        return path;
+    }
 
     private String getCollectionPath(String fid) throws FedoraClientException, SaxonApiException, URISyntaxException, DepositException {
         String path = "";
@@ -224,21 +239,7 @@ public class MPIPersists extends FedoraAction {
                 if (f != null && !f.isEmpty()) {
                     String pFid = f.replace("info:fedora/", "").replaceAll("#.*", "");
 
-                    GetObjectProfileResponse res = getObjectProfile(fid).execute();
-                    if (res.getStatus() != 200) {
-                        throw new DepositException(
-                                "Unexpected status[" + res.getStatus() + "] while interacting with Fedora Commons!");
-                    }
-
-                    String lbl = res.getLabel();
-                    if (lbl == null || lbl.isEmpty()) {
-                        throw new DepositException("Collection label is unknown!");
-                    }
-
-                    // remove diacritics from the lbl string
-                    lbl = StringUtils.stripAccents(lbl);
-                    lbl = lbl.replaceAll("[^a-zA-Z0-9]", "_");
-                    path = getCollectionPath(pFid) + "/" + lbl;
+                    path = getCollectionPath(pFid) + "/" + getSanitizedCollectionLabel(pFid);
 
                     if (iter.hasNext()) {
                         throw new DepositException("MPI doesn't do more than one parent collection!");
@@ -246,10 +247,29 @@ public class MPIPersists extends FedoraAction {
                     break; // get out of the loop
                 }
             }
-        }
-        else
-            throw new DepositException("Unexpected status[" + resp.getStatus() + "] while interacting with Fedora Commons!");
+        } else
+            throw new DepositException(
+                "Unexpected status[" + resp.getStatus() + "] while interacting with Fedora Commons!");
         return path;
+    }
+    
+    private String getSanitizedCollectionLabel(String fid)  throws FedoraClientException, SaxonApiException, URISyntaxException, DepositException {
+        GetObjectProfileResponse res = getObjectProfile(fid).execute();
+        if (res.getStatus() != 200) {
+            throw new DepositException(
+                    "Unexpected status[" + res.getStatus() + "] while interacting with Fedora Commons!");
+        }
+
+        String lbl = res.getLabel();
+        if (lbl == null || lbl.isEmpty()) {
+            throw new DepositException("Collection label is unknown!");
+        }
+
+        // remove diacritics from the lbl string
+        lbl = StringUtils.stripAccents(lbl);
+        lbl = lbl.replaceAll("[^a-zA-Z0-9]", "_");
+
+        return lbl;
     }
 
     public void rollback(Context context, List<XdmItem> events) {
