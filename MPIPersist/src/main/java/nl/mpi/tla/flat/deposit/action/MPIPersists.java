@@ -122,19 +122,24 @@ public class MPIPersists extends FedoraAction {
                 throw new DepositException("FAILED! Path: " + path + " is not specified in archive-roots-mapping.xml file");
             }
 
-            //path = resourcesDir + "/" + path;--  Not required anymore as the path is now determined based on the archive-roots-mapping.xml
-            Path dirPath = Paths.get(path);
+           Path dirPath = Paths.get(path);
+           Iterator<Path> iPath = dirPath.iterator();
+           Path p = null;
 
-            if (!Files.exists(dirPath)) {
-                try {
-                    context.registerRollbackEvent(this, "mkdir", "dir", dirPath.toString());
-                    Files.createDirectories(dirPath);
-                    logger.debug("Directory structure created! " + dirPath);
-                } catch (Exception ex) {
-                    throw new DepositException("Creation of directories failed:" + ex.getMessage());
+           for (Path part:dirPath){
+        	   p = (p==null?part:p.resolve(part));
+        	   if (!Files.exists(p)) {
+                   try {
+                       context.registerRollbackEvent(this, "mkdir", "dir", p.toString());
+                       Files.createDirectory(p);
+                       logger.debug("Directory created! " + p);
+                   } catch (Exception ex) {
+                       throw new DepositException("Creation of directories failed:" + ex.getMessage());
 
-                }
-            }
+                   }
+               }
+           }
+           
 
             for (Resource res : sip.getResources()) {
                 if (res.isUpdate() || res.isInsert()) {
