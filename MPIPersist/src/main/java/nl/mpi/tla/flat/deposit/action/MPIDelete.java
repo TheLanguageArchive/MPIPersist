@@ -21,16 +21,27 @@ import static com.yourmediashelf.fedora.client.FedoraClient.*;
 import com.ibm.icu.text.SimpleDateFormat;
 import com.yourmediashelf.fedora.client.request.ModifyDatastream;
 import com.yourmediashelf.fedora.client.response.DatastreamProfileResponse;
+import com.yourmediashelf.fedora.client.response.FedoraResponse;
 import com.yourmediashelf.fedora.client.response.ModifyDatastreamResponse;
 import com.yourmediashelf.fedora.client.response.RiSearchResponse;
 
 import java.io.File;
+import java.io.InputStream;
 import java.net.URI;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.Iterator;
+import java.util.List;
+import java.util.ListIterator;
+
 import javax.xml.transform.stream.StreamSource;
+
+import net.sf.saxon.s9api.QName;
+import net.sf.saxon.s9api.XdmAtomicValue;
+import net.sf.saxon.s9api.XdmDestination;
 import net.sf.saxon.s9api.XdmItem;
 import net.sf.saxon.s9api.XdmNode;
+import net.sf.saxon.s9api.XsltTransformer;
 import nl.mpi.tla.flat.deposit.Context;
 import nl.mpi.tla.flat.deposit.DepositException;
 import nl.mpi.tla.flat.deposit.sip.SIPInterface;
@@ -87,6 +98,8 @@ public class MPIDelete extends FedoraAction {
      							String reName = delTarget.getPath() + ".Deleted." + df;
      							File fileRename = new File(reName);
      							
+     							context.registerRollbackEvent(this, "rename", "old", delTarget.getAbsolutePath(), "new", fileRename.getAbsolutePath());
+     							
      							if (delTarget.renameTo(fileRename)) {
      								logger.debug("File renamed from " + delTarget + " to " + fileRename);
      								
@@ -96,8 +109,11 @@ public class MPIDelete extends FedoraAction {
      								mdsResponse = mds.versionable(false).execute();
      								if (mdsResponse.getStatus() != 200)
      									throw new DepositException("Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
+     								
+     								context.registerRollbackEvent(this, "updateLocation", "oldPath", delTarget.getPath(), "fid", fid.toString(), "dsid", dsid );
      	
      								mdsResponse = mds.dsLocation("file:/" + delTarget.getPath()).logMessage("Updated " + dsid).execute();
+     								
      								if (mdsResponse.getStatus() != 200)
      									throw new DepositException("Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
      	
@@ -106,6 +122,8 @@ public class MPIDelete extends FedoraAction {
      									throw new DepositException("Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
      	
      								logger.debug("Updated FedoraObject[" + fid + "][" + dsid + "]["+ mdsResponse.getLastModifiedDate() + "]");
+     								
+     								context.registerRollbackEvent(this, "addPID","fid", fid.toString());
      	
      								context.addPID(this.lookupPID(fid),new URI(fid + "#OBJ@" + Global.asOfDateTime(mdsResponse.getLastModifiedDate())));
      							} else {
@@ -126,8 +144,62 @@ public class MPIDelete extends FedoraAction {
         } catch(Exception e) {
             throw new DepositException("Connecting to Fedora Commons failed!",e);
         }
-
         return true;
     }
+    public void rollback(Context context, List<XdmItem> events) {
+		if (events.size() > 0) {
+			ModifyDatastreamResponse mdsResponse = null;
+			String dsid;
+			for (ListIterator<XdmItem> iter = events.listIterator(events.size()); iter.hasPrevious();) {
+				XdmItem event = iter.previous();
+				try {
+					String tpe = Saxon.xpath2string(event, "@type");
+					if (tpe.equals("rename")) {
+						File origName = new File(Saxon.xpath2string(event, "param[@name='old']/@value"));
+						File newName = new File(Saxon.xpath2string(event, "param[@name='new']/@value"));
+						if (newName.renameTo(origName)) {
+								logger.debug("File renamed from " + newName + " to " + origName);
+						}
+						else {
+							logger.error("File could not be renamed back to Original name during Rollback:");
+							logger.error("Original name: "+origName+"  New name: "+newName);
+						}
+						
+					}
+					else if (tpe.equals("updateLocation")){
+						File path = new File(Saxon.xpath2string(event, "param[@name='oldPath']/@value"));
+						String fid = Saxon.xpath2string(event, "param[@name='fid']/@value");
+						dsid = Saxon.xpath2string(event, "param[@name='dsid']/@value");
+						
+						ModifyDatastream mds = modifyDatastream(fid, dsid);
+						mdsResponse = mds.versionable(false).execute();
+						if (mdsResponse.getStatus() != 200)
+							throw new DepositException("Rollback:Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
+						mdsResponse = mds.dsLocation("file:/" + path.getPath()).logMessage("Rollback Updated " + dsid).execute();
+							
+						if (mdsResponse.getStatus() != 200)
+							throw new DepositException("Rollback:Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
+
+						mdsResponse = mds.versionable(true).execute();
+						if (mdsResponse.getStatus() != 200)
+							throw new DepositException("Rollback:Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
+
+						logger.debug("Rollback: Updated FedoraObject[" + fid + "][" + dsid + "]["+ mdsResponse.getLastModifiedDate() + "]");
+				
+					}
+					else if (tpe.equals("addPID")){
+						String fid = Saxon.xpath2string(event, "param[@name='fid']/@value");
+						URI fidURI = new URI(fid);
+						context.delPID(this.lookupPID(fidURI));
+					}
+					else {
+	                    logger.error("rollback action[" + this.getName() + "] rollback unknown event[" + tpe + "]!");
+	                }
+				} catch (Exception ex) {
+					logger.error("rollback action[" + this.getName() + "] event[" + event + "] failed!", ex);
+				}
+			}
+		}
+	}
     
 }
