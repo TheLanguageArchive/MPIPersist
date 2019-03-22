@@ -202,7 +202,7 @@ public class MPIPersists extends FedoraAction {
 					logger.debug("Moved file from :" + res.getFile().toPath() + " to: " + target.getPath());
 					res.setFile(target);
 				} else {
-					logger.debug("The res was neither for insert not for update. Persist action did not perform on any res!");
+					logger.debug("The res was neither for insert not for update. MPIPersist action did not perform on the res!- "+res.getFID().toString());
 				}
 			}
 
@@ -292,8 +292,15 @@ public class MPIPersists extends FedoraAction {
 						}
 					} else if (tpe.equals("mkdir")) {
 						File dir = new File(Saxon.xpath2string(event, "param[@name='dir']/@value"));
-						Files.deleteIfExists(dir.toPath());
-						logger.debug("rollback action[" + this.getName() + "] event[" + tpe + "] removed dir[" + dir + "]");
+						if (dir.list().length == 0) {
+							logger.info("Directory["+dir.toPath()+" is empty! (Safe to delete)");
+							if (Files.deleteIfExists(dir.toPath())) 
+								logger.debug("rollback action[" + this.getName() + "] event[" + tpe + "] removed dir[" + dir + "]");	
+							else 
+								logger.debug("But-- rollback action[" + this.getName() + "] event[" + tpe + "] did not remove dir[" + dir + "]");
+						}
+						else
+							logger.info("Directory["+dir.toPath()+" is not empty!!!");
 					} else if (tpe.equals("updateLocation")) {
 						File path = new File(Saxon.xpath2string(event, "param[@name='oldPath']/@value"));
 						fid = Saxon.xpath2string(event, "param[@name='fid']/@value");
