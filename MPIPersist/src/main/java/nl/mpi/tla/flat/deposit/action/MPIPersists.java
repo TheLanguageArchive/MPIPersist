@@ -123,7 +123,7 @@ public class MPIPersists extends FedoraAction {
 
 			Path dirPath = Paths.get(path);
 			Iterator<Path> iPath = dirPath.iterator();
-			Path p = null;
+			Path p = Paths.get("/");
 
 			for (Path part : dirPath) {
 				p = (p == null ? part : p.resolve(part));
