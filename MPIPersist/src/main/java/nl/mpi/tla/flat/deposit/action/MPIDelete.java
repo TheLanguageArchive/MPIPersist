@@ -4,17 +4,21 @@
 package nl.mpi.tla.flat.deposit.action;
 
 import java.net.URI;
-import java.nio.file.AtomicMoveNotSupportedException;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Iterator;
 import java.util.List;
-import java.util.ListIterator;
+import java.util.Base64;
+import java.util.UUID;
 import net.sf.saxon.s9api.XdmItem;
 import net.sf.saxon.s9api.XdmNode;
 import nl.mpi.tla.flat.deposit.Context;
@@ -28,10 +32,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Moves the conventional current-name link of resources removed from a SIP to
- * a deleted-name link. The immutable target is never copied or removed.
- * Fedora deletion remains the responsibility of the following FedoraDelete
- * action in the workflow.
+ * Relocates a deleted resource's current external payload to a deleted-name
+ * sibling and reconstructs the immutable OCFL version through Fedora's
+ * relocation endpoint. Fedora deletion remains the responsibility of the
+ * following FedoraDelete action in the workflow.
  */
 public class MPIDelete extends FedoraAction {
 
@@ -71,14 +75,17 @@ public class MPIDelete extends FedoraAction {
             return;
         }
         Path payload = Path.of(external);
-        if (!Files.exists(payload, LinkOption.NOFOLLOW_LINKS))
-            throw new DepositException("Payload to delete doesn't exist: " + payload);
+        // A lost HTTP response is safe to retry: Fedora already points at the
+        // deleted sibling, so do not generate a second deletion suffix.
+        if (payload.getFileName().toString().contains(".Deleted.")) {
+            logger.info("Resource[{}] already has a relocated deleted payload [{}]", fid, payload);
+            return;
+        }
+        if (Files.isSymbolicLink(payload) || !Files.isRegularFile(payload, LinkOption.NOFOLLOW_LINKS))
+            throw new DepositException("Payload to delete isn't a regular current file: " + payload);
 
-        Path current = currentLink(payload);
-        Path deleted = (current == null ? payload : current).resolveSibling(
-                (current == null ? payload : current).getFileName() + ".Deleted." + DELETED_SUFFIX.format(Instant.now()));
-        move(current == null ? payload : current, deleted);
-        context.registerRollbackEvent(this, "move", "src", deleted.toString(), "dst", (current == null ? payload : current).toString());
+        Path deleted = payload.resolveSibling(payload.getFileName() + ".Deleted." + DELETED_SUFFIX.format(Instant.now()));
+        relocateExternalPayload(fid, payload, deleted, "delete-" + UUID.randomUUID());
         logger.info("Marked resource[{}] payload as deleted: [{}]", fid, deleted);
     }
 
@@ -94,18 +101,28 @@ public class MPIDelete extends FedoraAction {
         }
     }
 
-    /** Return the sibling current-name symlink, if this immutable payload has one. */
-    private Path currentLink(Path payload) throws Exception {
-        try (var entries = Files.list(payload.getParent())) {
-            return entries.filter(Files::isSymbolicLink)
-                    .filter(path -> {
-                        try {
-                            return Files.readSymbolicLink(path).equals(payload.getFileName());
-                        } catch (Exception ex) {
-                            return false;
-                        }
-                    }).findFirst().orElse(null);
-        }
+    private void relocateExternalPayload(final URI fid, final Path current, final Path deleted,
+                                         final String operationId) throws Exception {
+        final URI endpoint = URI.create(fedoraConfig.getString("localServer") + "/" + fid + "/OBJ/fcr:relocate-external");
+        final String expected = fedoraFileUri(current);
+        final String replacement = fedoraFileUri(deleted);
+        final String body = "{\"operationId\":\"" + operationId + "\",\"expectedUrl\":\"" + expected
+                + "\",\"replacementUrl\":\"" + replacement + "\"}";
+        final String password = readSecret(fedoraConfig, "userPass", "userPassFile");
+        final String credentials = Base64.getEncoder().encodeToString((getFedoraUser() + ":" + password)
+                .getBytes(StandardCharsets.UTF_8));
+        final HttpRequest request = HttpRequest.newBuilder(endpoint).timeout(Duration.ofMinutes(2))
+                .header("Authorization", "Basic " + credentials).header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8)).build();
+        final HttpResponse<String> response = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(20)).build()
+                .send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        if (response.statusCode() >= 300)
+            throw new DepositException("Fedora external relocation failed for " + fid + ", status "
+                    + response.statusCode() + ": " + response.body());
+    }
+
+    private static String fedoraFileUri(final Path path) {
+        return path.toUri().toString().replaceFirst("^file:///", "file:/");
     }
 
     private String normalizeFID(String value) {
@@ -117,28 +134,4 @@ public class MPIDelete extends FedoraAction {
         return fid;
     }
 
-    private static void move(Path source, Path target) throws Exception {
-        try {
-            Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
-        } catch (AtomicMoveNotSupportedException ex) {
-            Files.move(source, target);
-        }
-    }
-
-    @Override
-    public void rollback(Context context, List<XdmItem> events) {
-        for (ListIterator<XdmItem> iterator = events.listIterator(events.size()); iterator.hasPrevious();) {
-            XdmItem event = iterator.previous();
-            try {
-                if (!"move".equals(Saxon.xpath2string(event, "@type")))
-                    continue;
-                Path source = Path.of(Saxon.xpath2string(event, "param[@name='src']/@value"));
-                Path target = Path.of(Saxon.xpath2string(event, "param[@name='dst']/@value"));
-                if (Files.exists(source, LinkOption.NOFOLLOW_LINKS) && !Files.exists(target, LinkOption.NOFOLLOW_LINKS))
-                    move(source, target);
-            } catch (Exception ex) {
-                logger.error("Rollback event [{}] failed", event, ex);
-            }
-        }
-    }
 }

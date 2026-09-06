@@ -26,6 +26,7 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Base64;
 import java.util.List;
+import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
 import javax.xml.transform.stream.StreamSource;
@@ -95,21 +96,12 @@ public class MPIPersists extends FedoraAction {
                 move(source, canonical);
                 context.registerRollbackEvent(this, "insert-move", "src", canonical.toString(), "dst", source.toString());
             } else {
-                if (Files.isSymbolicLink(canonical) || !Files.isRegularFile(canonical, LinkOption.NOFOLLOW_LINKS)) {
+                final Path journal = canonical.resolveSibling("." + canonical.getFileName() + ".mpipersist-update");
+                if (!Files.exists(journal, LinkOption.NOFOLLOW_LINKS)
+                        && (Files.isSymbolicLink(canonical) || !Files.isRegularFile(canonical, LinkOption.NOFOLLOW_LINKS))) {
                     throw new DepositException("Updated resource has no regular current payload at " + canonical);
                 }
-                final Path archived = versionedPath(canonical);
-                final Path staged = canonical.resolveSibling(canonical.getFileName() + ".incoming-" + UUID.randomUUID());
-                move(source, staged);
-                try {
-                    relocateExternalPayload(resource, canonical, archived);
-                    move(staged, canonical);
-                } catch (Exception ex) {
-                    if (Files.exists(staged, LinkOption.NOFOLLOW_LINKS) && !Files.exists(source, LinkOption.NOFOLLOW_LINKS)) {
-                        move(staged, source);
-                    }
-                    throw ex;
-                }
+                resumeUpdate(resource, source, canonical);
             }
             resource.setFile(canonical.toFile());
             LOGGER.info("Persisted resource [{}] at current path [{}]", source, canonical);
@@ -120,10 +112,84 @@ public class MPIPersists extends FedoraAction {
         }
     }
 
-    private void relocateExternalPayload(final Resource resource, final Path canonical, final Path archived) throws Exception {
+    /**
+     * The relocation endpoint durably journals the OCFL reconstruction.  This
+     * small, adjacent journal covers the other half of the operation: the
+     * incoming file that must replace the now-relocated current file.  It is
+     * intentionally retained on failure so rerunning the same SIP resumes the
+     * exact operation rather than guessing whether Fedora or the filesystem
+     * already advanced.
+     */
+    private void resumeUpdate(final Resource resource, final Path source, final Path canonical) throws Exception {
+        final Path journalPath = canonical.resolveSibling("." + canonical.getFileName() + ".mpipersist-update");
+        UpdateJournal journal = Files.exists(journalPath, LinkOption.NOFOLLOW_LINKS)
+                ? readJournal(journalPath, canonical)
+                : createJournal(journalPath, source, canonical);
+
+        if ("CREATED".equals(journal.phase())) {
+            if (!Files.exists(source, LinkOption.NOFOLLOW_LINKS))
+                throw new DepositException("Incoming payload is missing while resuming " + journalPath);
+            move(source, journal.staged());
+            journal = journal.withPhase("STAGED");
+            writeJournal(journalPath, journal);
+        }
+        if ("STAGED".equals(journal.phase())) {
+            relocateExternalPayload(resource, canonical, journal.archived(), journal.operationId());
+            journal = journal.withPhase("RELOCATED");
+            writeJournal(journalPath, journal);
+        }
+        if ("RELOCATED".equals(journal.phase())) {
+            if (!Files.isRegularFile(journal.staged(), LinkOption.NOFOLLOW_LINKS))
+                throw new DepositException("Staged incoming payload is missing while resuming " + journalPath);
+            if (Files.exists(canonical, LinkOption.NOFOLLOW_LINKS))
+                throw new DepositException("Current payload unexpectedly exists while resuming " + journalPath);
+            move(journal.staged(), canonical);
+            Files.deleteIfExists(journalPath);
+        }
+    }
+
+    private static UpdateJournal createJournal(final Path journalPath, final Path source, final Path canonical) throws IOException {
+        final UpdateJournal journal = new UpdateJournal("relocate-" + UUID.randomUUID(), source,
+                canonical.resolveSibling(canonical.getFileName() + ".incoming-" + UUID.randomUUID()),
+                versionedPath(canonical), "CREATED");
+        writeJournal(journalPath, journal);
+        return journal;
+    }
+
+    private static UpdateJournal readJournal(final Path journalPath, final Path canonical) throws IOException, DepositException {
+        final Properties values = new Properties();
+        try (var input = Files.newInputStream(journalPath)) {
+            values.load(input);
+        }
+        final UpdateJournal journal = new UpdateJournal(values.getProperty("operationId"), Path.of(values.getProperty("source", "")),
+                Path.of(values.getProperty("staged", "")), Path.of(values.getProperty("archived", "")), values.getProperty("phase"));
+        if (!journal.validFor(canonical))
+            throw new DepositException("Invalid MPIPersist recovery journal: " + journalPath);
+        return journal;
+    }
+
+    private static void writeJournal(final Path path, final UpdateJournal journal) throws IOException {
+        final Properties values = new Properties();
+        values.setProperty("operationId", journal.operationId());
+        values.setProperty("source", journal.source().toString());
+        values.setProperty("staged", journal.staged().toString());
+        values.setProperty("archived", journal.archived().toString());
+        values.setProperty("phase", journal.phase());
+        final Path temporary = path.resolveSibling(path.getFileName() + ".tmp");
+        try (var output = Files.newOutputStream(temporary)) {
+            values.store(output, "MPIPersist external payload update recovery");
+        }
+        try {
+            Files.move(temporary, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException ex) {
+            Files.move(temporary, path, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private void relocateExternalPayload(final Resource resource, final Path canonical, final Path archived,
+                                         final String operationId) throws Exception {
         final String fid = resource.getFID(true).toString();
         final URI endpoint = URI.create(fedoraConfig.getString("localServer") + "/" + fid + "/OBJ/fcr:relocate-external");
-        final String operationId = "relocate-" + Integer.toUnsignedString((fid + archived).hashCode(), 36);
         final String expected = fedoraFileUri(canonical);
         final String replacement = fedoraFileUri(archived);
         final String body = "{\"operationId\":\"" + operationId + "\",\"expectedUrl\":\"" + expected
@@ -144,6 +210,21 @@ public class MPIPersists extends FedoraAction {
                     + response.statusCode() + ": " + response.body());
         }
         LOGGER.info("Relocated prior payload for resource [{}] from [{}] to [{}]", fid, canonical, archived);
+    }
+
+    private record UpdateJournal(String operationId, Path source, Path staged, Path archived, String phase) {
+        UpdateJournal withPhase(final String nextPhase) {
+            return new UpdateJournal(operationId, source, staged, archived, nextPhase);
+        }
+
+        boolean validFor(final Path canonical) {
+            return operationId != null && operationId.matches("[A-Za-z0-9._-]{1,128}")
+                    && Set.of("CREATED", "STAGED", "RELOCATED").contains(phase)
+                    && canonical.getParent().equals(staged.getParent())
+                    && canonical.getParent().equals(archived.getParent())
+                    && staged.getFileName().toString().startsWith(canonical.getFileName() + ".incoming-")
+                    && archived.getFileName().toString().startsWith(canonical.getFileName() + ".");
+        }
     }
 
     /**
