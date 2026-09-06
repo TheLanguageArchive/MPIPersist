@@ -1,205 +1,144 @@
-/* 
- * Copyright (C) 2015-2017 The Language Archive
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/*
+ * Copyright (C) 2015-2026 The Language Archive
  */
 package nl.mpi.tla.flat.deposit.action;
 
-import static com.yourmediashelf.fedora.client.FedoraClient.*;
-
-import com.ibm.icu.text.SimpleDateFormat;
-import com.yourmediashelf.fedora.client.request.ModifyDatastream;
-import com.yourmediashelf.fedora.client.response.DatastreamProfileResponse;
-import com.yourmediashelf.fedora.client.response.FedoraResponse;
-import com.yourmediashelf.fedora.client.response.ModifyDatastreamResponse;
-import com.yourmediashelf.fedora.client.response.RiSearchResponse;
-
-import java.io.File;
-import java.io.InputStream;
 import java.net.URI;
-import java.util.ArrayList;
-import java.util.Date;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.Iterator;
 import java.util.List;
 import java.util.ListIterator;
-
-import javax.xml.transform.stream.StreamSource;
-
-import net.sf.saxon.s9api.QName;
-import net.sf.saxon.s9api.XdmAtomicValue;
-import net.sf.saxon.s9api.XdmDestination;
 import net.sf.saxon.s9api.XdmItem;
 import net.sf.saxon.s9api.XdmNode;
-import net.sf.saxon.s9api.XsltTransformer;
 import nl.mpi.tla.flat.deposit.Context;
 import nl.mpi.tla.flat.deposit.DepositException;
 import nl.mpi.tla.flat.deposit.sip.SIPInterface;
 import nl.mpi.tla.flat.deposit.util.Global;
-import nl.mpi.tla.flat.deposit.util.Saxon;
+import nl.mpi.tla.util.Saxon;
+import org.fcrepo.client.FcrepoResponse;
+import org.fcrepo.client.HeadBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- *
- * @author pavi
+ * Moves the conventional current-name link of resources removed from a SIP to
+ * a deleted-name link. The immutable target is never copied or removed.
+ * Fedora deletion remains the responsibility of the following FedoraDelete
+ * action in the workflow.
  */
 public class MPIDelete extends FedoraAction {
 
-    private static final Logger logger = LoggerFactory.getLogger(MPIDelete.class.getName());
+    private static final Logger logger = LoggerFactory.getLogger(MPIDelete.class);
+    private static final String EXTERNAL_CONTENT = "http://fedora.info/definitions/v4/repository#ExternalContent";
+    private static final DateTimeFormatter DELETED_SUFFIX = DateTimeFormatter
+            .ofPattern("yyyy-MM-dd_HH-mm-ss.SSS").withZone(ZoneOffset.UTC);
 
     @Override
     public boolean perform(Context context) throws DepositException {
         try {
             connect(context);
-
             SIPInterface sip = context.getSIP();
-            
-            String sid = sip.getFID().toString().replaceAll("@.*","").replaceAll("#.*","");            
-            String sparql = "SELECT ?fid WHERE { ?fid <info:fedora/fedora-system:def/relations-external#isConstituentOf> <info:fedora/"+sid+"> } ";
-            logger.debug("SPARQL["+sparql+"]");
-            RiSearchResponse resp = riSearch(sparql).format("sparql").execute();
-            if (resp.getStatus()==200) {
-                XdmNode tpl = Saxon.buildDocument(new StreamSource(resp.getEntityInputStream()));
-                logger.debug("RESULT["+tpl.toString()+"]");
-                
-                for (Iterator<XdmItem> iter=Saxon.xpathIterator(tpl, "//*:results/*:result/*:fid/normalize-space(@uri)");iter.hasNext();) {
-                    XdmItem f = iter.next();
-                    if (f!=null && !f.getStringValue().isEmpty()) {
-                        URI fid = new URI(f.getStringValue().replace("info:fedora/",""));
-                        if (sip.getResourceByFID(fid)!=null)
-                            continue;
-                        logger.debug("DELETE: Resource["+fid+"]");
-						
-                        //Customization for MPI
-						String dsid = "OBJ";
-                        DatastreamProfileResponse res = getDatastream(fid.toString(),dsid).execute();
-                        if (res.getStatus() != 200)
-                           throw new DepositException("Unexpected status[" + res.getStatus()+ "] while interacting with Fedora Commons!");
-                        String loc = res.getDatastreamProfile().getDsLocation();
-                        String prefix = "file:";
-                        if (loc.startsWith(prefix)){
-                        	 
-                        	 File delTarget = new File(loc.replace(prefix, ""));
-                             
-                             if(delTarget.exists()){                        
-     	                        //Rename file to .delete.timestamp
-     	                        String df = new SimpleDateFormat("yyyy-MM-dd_hh-mm-ss").format(new Date());
-     							String reName = delTarget.getPath() + ".Deleted." + df;
-     							File fileRename = new File(reName);
-     							
-     							context.registerRollbackEvent(this, "rename", "old", delTarget.getAbsolutePath(), "new", fileRename.getAbsolutePath());
-     							
-     							if (delTarget.renameTo(fileRename)) {
-     								logger.debug("File renamed from " + delTarget + " to " + fileRename);
-     								
-     								ModifyDatastreamResponse mdsResponse = null;
-     								ModifyDatastream mds = modifyDatastream(fid.toString(), dsid);
-     	
-     								mdsResponse = mds.versionable(false).execute();
-     								if (mdsResponse.getStatus() != 200)
-     									throw new DepositException("Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
-     								
-     								context.registerRollbackEvent(this, "updateLocation", "oldPath", delTarget.getPath(), "fid", fid.toString(), "dsid", dsid );
-     	
-     								mdsResponse = mds.dsLocation("file:/" + delTarget.getPath()).logMessage("Updated " + dsid).execute();
-     								
-     								if (mdsResponse.getStatus() != 200)
-     									throw new DepositException("Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
-     	
-     								mdsResponse = mds.versionable(true).execute();
-     								if (mdsResponse.getStatus() != 200)
-     									throw new DepositException("Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
-     	
-     								logger.debug("Updated FedoraObject[" + fid + "][" + dsid + "]["+ mdsResponse.getLastModifiedDate() + "]");
-     								
-     								context.registerRollbackEvent(this, "addPID","fid", fid.toString());
-     	
-     								context.addPID(this.lookupPID(fid),new URI(fid + "#OBJ@" + Global.asOfDateTime(mdsResponse.getLastModifiedDate())));
-     							} else {
-     								throw new DepositException("FAILED! Failed to rename the resource with same name as new one while updating the resource!");
-     							}
-     	                    }
-                             else {
-                             	throw new DepositException("FAILED! File to be deleted: "+delTarget+" does not exist in the filesystem. Fedora and filesystem are out of sync!!!");
-                             }					
-                        }
-                        else {
-                        	logger.warn("The res to be deleted is without prefix `file:`. Check!");
-                        }	
-                    }
-                }
-            } else
-                throw new DepositException("Unexpected status["+resp.getStatus()+"] while querying Fedora Commons!");
-        } catch(Exception e) {
-            throw new DepositException("Connecting to Fedora Commons failed!",e);
+            String sid = sip.getFID().toString().replaceFirst("@.*$", "").replaceFirst("#.*$", "");
+            String query = "SELECT ?fid WHERE { ?fid <info:fedora/fedora-system:def/relations-external#isConstituentOf> <"
+                    + fedoraConfig.getString("localBase") + "/" + sid + "> }";
+            XdmNode result = sparql(query);
+            for (Iterator<XdmItem> iterator = Saxon.xpathIterator(result,
+                    "//srx:results/srx:result/srx:binding[@name='fid']/*[self::srx:uri or self::srx:literal]", null, Global.NAMESPACES);
+                    iterator.hasNext();) {
+                URI fid = URI.create(normalizeFID(iterator.next().getStringValue()));
+                if (sip.getResourceByFID(fid) == null)
+                    markDeleted(context, fid);
+            }
+            return true;
+        } catch (DepositException ex) {
+            throw ex;
+        } catch (Exception ex) {
+            throw new DepositException("Couldn't prepare deleted payloads", ex);
         }
-        return true;
     }
+
+    private void markDeleted(Context context, URI fid) throws Exception {
+        URI external = externalContent(fid);
+        if (external == null || !"file".equalsIgnoreCase(external.getScheme())) {
+            logger.warn("Resource[{}] has no file-based external OBJ content; skipped", fid);
+            return;
+        }
+        Path payload = Path.of(external);
+        if (!Files.exists(payload, LinkOption.NOFOLLOW_LINKS))
+            throw new DepositException("Payload to delete doesn't exist: " + payload);
+
+        Path current = currentLink(payload);
+        Path deleted = (current == null ? payload : current).resolveSibling(
+                (current == null ? payload : current).getFileName() + ".Deleted." + DELETED_SUFFIX.format(Instant.now()));
+        move(current == null ? payload : current, deleted);
+        context.registerRollbackEvent(this, "move", "src", deleted.toString(), "dst", (current == null ? payload : current).toString());
+        logger.info("Marked resource[{}] payload as deleted: [{}]", fid, deleted);
+    }
+
+    private URI externalContent(URI fid) throws Exception {
+        URI obj = URI.create(fedoraConfig.getString("localServer") + "/" + fid + "/OBJ");
+        try (FcrepoResponse response = new HeadBuilder(obj, fedoraClient).perform()) {
+            if (response.getStatusCode() == 404 || response.getStatusCode() == 410)
+                return null;
+            if (response.getStatusCode() >= 300)
+                throw new DepositException("Couldn't read OBJ for [" + fid + "], status " + response.getStatusCode());
+            List<URI> links = response.getLinkHeaders(EXTERNAL_CONTENT);
+            return links.isEmpty() ? null : links.get(0);
+        }
+    }
+
+    /** Return the sibling current-name symlink, if this immutable payload has one. */
+    private Path currentLink(Path payload) throws Exception {
+        try (var entries = Files.list(payload.getParent())) {
+            return entries.filter(Files::isSymbolicLink)
+                    .filter(path -> {
+                        try {
+                            return Files.readSymbolicLink(path).equals(payload.getFileName());
+                        } catch (Exception ex) {
+                            return false;
+                        }
+                    }).findFirst().orElse(null);
+        }
+    }
+
+    private String normalizeFID(String value) {
+        String fid = value.trim().replaceFirst("#.*$", "");
+        for (String prefix : List.of(fedoraConfig.getString("localBase") + "/", fedoraConfig.getString("localServer") + "/", "info:fedora/")) {
+            if (fid.startsWith(prefix))
+                return fid.substring(prefix.length());
+        }
+        return fid;
+    }
+
+    private static void move(Path source, Path target) throws Exception {
+        try {
+            Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException ex) {
+            Files.move(source, target);
+        }
+    }
+
+    @Override
     public void rollback(Context context, List<XdmItem> events) {
-		if (events.size() > 0) {
-			ModifyDatastreamResponse mdsResponse = null;
-			String dsid;
-			for (ListIterator<XdmItem> iter = events.listIterator(events.size()); iter.hasPrevious();) {
-				XdmItem event = iter.previous();
-				try {
-					String tpe = Saxon.xpath2string(event, "@type");
-					if (tpe.equals("rename")) {
-						File origName = new File(Saxon.xpath2string(event, "param[@name='old']/@value"));
-						File newName = new File(Saxon.xpath2string(event, "param[@name='new']/@value"));
-						if (newName.renameTo(origName)) {
-								logger.debug("File renamed from " + newName + " to " + origName);
-						}
-						else {
-							logger.error("File could not be renamed back to Original name during Rollback:");
-							logger.error("Original name: "+origName+"  New name: "+newName);
-						}
-						
-					}
-					else if (tpe.equals("updateLocation")){
-						File path = new File(Saxon.xpath2string(event, "param[@name='oldPath']/@value"));
-						String fid = Saxon.xpath2string(event, "param[@name='fid']/@value");
-						dsid = Saxon.xpath2string(event, "param[@name='dsid']/@value");
-						
-						ModifyDatastream mds = modifyDatastream(fid, dsid);
-						mdsResponse = mds.versionable(false).execute();
-						if (mdsResponse.getStatus() != 200)
-							throw new DepositException("Rollback:Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
-						mdsResponse = mds.dsLocation("file:/" + path.getPath()).logMessage("Rollback Updated " + dsid).execute();
-							
-						if (mdsResponse.getStatus() != 200)
-							throw new DepositException("Rollback:Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
-
-						mdsResponse = mds.versionable(true).execute();
-						if (mdsResponse.getStatus() != 200)
-							throw new DepositException("Rollback:Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
-
-						logger.debug("Rollback: Updated FedoraObject[" + fid + "][" + dsid + "]["+ mdsResponse.getLastModifiedDate() + "]");
-				
-					}
-					else if (tpe.equals("addPID")){
-						String fid = Saxon.xpath2string(event, "param[@name='fid']/@value");
-						URI fidURI = new URI(fid);
-						context.delPID(this.lookupPID(fidURI));
-					}
-					else {
-	                    logger.error("rollback action[" + this.getName() + "] rollback unknown event[" + tpe + "]!");
-	                }
-				} catch (Exception ex) {
-					logger.error("rollback action[" + this.getName() + "] event[" + event + "] failed!", ex);
-				}
-			}
-		}
-	}
-    
+        for (ListIterator<XdmItem> iterator = events.listIterator(events.size()); iterator.hasPrevious();) {
+            XdmItem event = iterator.previous();
+            try {
+                if (!"move".equals(Saxon.xpath2string(event, "@type")))
+                    continue;
+                Path source = Path.of(Saxon.xpath2string(event, "param[@name='src']/@value"));
+                Path target = Path.of(Saxon.xpath2string(event, "param[@name='dst']/@value"));
+                if (Files.exists(source, LinkOption.NOFOLLOW_LINKS) && !Files.exists(target, LinkOption.NOFOLLOW_LINKS))
+                    move(source, target);
+            } catch (Exception ex) {
+                logger.error("Rollback event [{}] failed", event, ex);
+            }
+        }
+    }
 }

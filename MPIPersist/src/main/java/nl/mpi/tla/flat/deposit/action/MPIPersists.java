@@ -1,337 +1,194 @@
-/* 
- * Copyright (C) 2015-2017 The Language Archive
+/*
+ * Copyright (C) 2015-2026 The Language Archive
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 package nl.mpi.tla.flat.deposit.action;
 
 import java.io.File;
+import java.io.IOException;
 import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.Date;
-import java.util.Iterator;
+import java.nio.file.StandardCopyOption;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.Base64;
 import java.util.List;
-import java.util.ListIterator;
 import java.util.Set;
-
+import java.util.UUID;
 import javax.xml.transform.stream.StreamSource;
-
-import org.apache.commons.configuration.XMLConfiguration;
-import org.apache.commons.lang3.StringUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.w3c.dom.NodeList;
-
-import com.ibm.icu.text.SimpleDateFormat;
-import static com.yourmediashelf.fedora.client.FedoraClient.*;
-import com.yourmediashelf.fedora.client.FedoraClientException;
-import com.yourmediashelf.fedora.client.request.ModifyDatastream;
-import com.yourmediashelf.fedora.client.response.GetObjectProfileResponse;
-import com.yourmediashelf.fedora.client.response.ModifyDatastreamResponse;
-import com.yourmediashelf.fedora.client.response.RiSearchResponse;
-import java.net.URISyntaxException;
-
-import net.sf.saxon.s9api.Axis;
-import net.sf.saxon.s9api.QName;
 import net.sf.saxon.s9api.SaxonApiException;
 import net.sf.saxon.s9api.XdmItem;
-import net.sf.saxon.s9api.XdmNode;
-import net.sf.saxon.s9api.XdmSequenceIterator;
 import nl.mpi.tla.flat.deposit.Context;
 import nl.mpi.tla.flat.deposit.DepositException;
-import nl.mpi.tla.flat.deposit.sip.Collection;
+import nl.mpi.tla.flat.deposit.action.persist.util.PersistDatasetNameRetriever;
+import nl.mpi.tla.flat.deposit.action.persist.util.PersistencePolicies;
+import nl.mpi.tla.flat.deposit.action.persist.util.PersistencePolicy;
+import nl.mpi.tla.flat.deposit.action.persist.util.PersistencePolicyLoader;
+import nl.mpi.tla.flat.deposit.action.persist.util.PersistencePolicyMatcher;
 import nl.mpi.tla.flat.deposit.sip.Resource;
-import nl.mpi.tla.flat.deposit.sip.cmdi.CMD;
-import nl.mpi.tla.flat.deposit.util.Global;
-import nl.mpi.tla.flat.deposit.util.Saxon;
-import static nl.mpi.tla.flat.deposit.util.Global.NAMESPACES;
+import nl.mpi.tla.flat.deposit.sip.SIPInterface;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
+ * External-payload persistence implementation for Fedora 7.
  *
- * @author pavi
+ * <p>Current payloads keep their unsuffixed names. When updating a resource,
+ * the Fedora relocation extension moves the old current payload to a
+ * timestamped sibling and reconstructs the last OCFL version to point there.
+ * The incoming payload is then installed at the unsuffixed path; the ordinary
+ * Fedora update and post-commit memento actions retain their existing roles.</p>
  */
 public class MPIPersists extends FedoraAction {
 
-	private static final Logger logger = LoggerFactory.getLogger(MPIPersists.class.getName());
+    private static final Logger LOGGER = LoggerFactory.getLogger(MPIPersists.class);
+    private static final DateTimeFormatter VERSION_SUFFIX = DateTimeFormatter
+            .ofPattern("yyyy-MM-dd_HH-mm-ss.SSS").withZone(ZoneOffset.UTC);
 
-	@Override
-	public boolean perform(Context context) throws DepositException {
-		try {
-			connect(context);
+    @Override
+    public boolean perform(final Context context) throws DepositException {
+        connect(context);
+        final String resourcesDir = getParameter("resourcesDir", null);
+        final String policyFile = getParameter("policyFile", null);
+        final SIPInterface sip = context.getSIP();
+        final PersistencePolicies policies;
+        try {
+            final String datasetName = new PersistDatasetNameRetriever()
+                    .getDatasetName(sip.getRecord(), getParameter("xpathDatasetName"));
+            policies = new PersistencePolicyLoader(new File(resourcesDir))
+                    .loadPersistencePolicies(new StreamSource(policyFile), sip, datasetName);
+        } catch (SaxonApiException | IllegalStateException ex) {
+            throw new DepositException("Error loading persistence policy '" + policyFile + "'", ex);
+        }
 
-			String resourcesDir = getParameter("resourcesDir");
-			String xpathDSName = getParameter("xpathDatasetName");
-			String pre = this.getParameter("namespace", "lat");
-			String archRootMapping = this.getParameter("archiveRootMapping");
+        for (final Resource resource : sip.getResources()) {
+            if (!resource.isInsert() && !resource.isUpdate()) {
+                continue;
+            }
+            final PersistencePolicy policy = new PersistencePolicyMatcher(policies).matchPersistencePolicy(resource);
+            persist(context, resource, policy.getTarget().toPath().resolve(resource.getFile().getName()));
+        }
+        return true;
+    }
 
-			// Check the archive root mapping file
-			File archRootMap = new File(archRootMapping);
-			if (!archRootMap.exists()) {
-				logger.error("The Archive root mapping configuration[" + archRootMapping + "] doesn't exist!");
-				return false;
-			} else if (!archRootMap.isFile()) {
-				logger.error("The Archive root mapping configuration[" + archRootMapping + "] isn't a file!");
-				return false;
-			} else if (!archRootMap.canRead()) {
-				logger.error("The Archive root mapping configuration[" + archRootMapping + "] can't be read!");
-				return false;
-			}
-			logger.debug("Fedora configuration[" + archRootMap.getAbsolutePath() + "]");
+    private void persist(final Context context, final Resource resource, final Path canonical) throws DepositException {
+        final Path source = resource.getFile().toPath();
+        try {
+            Files.createDirectories(canonical.getParent());
+            if (resource.isInsert()) {
+                if (Files.exists(canonical, LinkOption.NOFOLLOW_LINKS)) {
+                    throw new DepositException("File path clash for inserted resource: " + canonical);
+                }
+                move(source, canonical);
+                context.registerRollbackEvent(this, "insert-move", "src", canonical.toString(), "dst", source.toString());
+            } else {
+                if (Files.isSymbolicLink(canonical) || !Files.isRegularFile(canonical, LinkOption.NOFOLLOW_LINKS)) {
+                    throw new DepositException("Updated resource has no regular current payload at " + canonical);
+                }
+                final Path archived = versionedPath(canonical);
+                final Path staged = canonical.resolveSibling(canonical.getFileName() + ".incoming-" + UUID.randomUUID());
+                move(source, staged);
+                try {
+                    relocateExternalPayload(resource, canonical, archived);
+                    move(staged, canonical);
+                } catch (Exception ex) {
+                    if (Files.exists(staged, LinkOption.NOFOLLOW_LINKS) && !Files.exists(source, LinkOption.NOFOLLOW_LINKS)) {
+                        move(staged, source);
+                    }
+                    throw ex;
+                }
+            }
+            resource.setFile(canonical.toFile());
+            LOGGER.info("Persisted resource [{}] at current path [{}]", source, canonical);
+        } catch (DepositException ex) {
+            throw ex;
+        } catch (Exception ex) {
+            throw new DepositException("Couldn't persist resource at " + canonical, ex);
+        }
+    }
 
-			CMD sip = (CMD) context.getSIP();
+    private void relocateExternalPayload(final Resource resource, final Path canonical, final Path archived) throws Exception {
+        final String fid = resource.getFID(true).toString();
+        final URI endpoint = URI.create(fedoraConfig.getString("localServer") + "/" + fid + "/OBJ/fcr:relocate-external");
+        final String operationId = "relocate-" + Integer.toUnsignedString((fid + archived).hashCode(), 36);
+        final String expected = fedoraFileUri(canonical);
+        final String replacement = fedoraFileUri(archived);
+        final String body = "{\"operationId\":\"" + operationId + "\",\"expectedUrl\":\"" + expected
+                + "\",\"replacementUrl\":\"" + replacement + "\"}";
+        final String password = readSecret(fedoraConfig, "userPass", "userPassFile");
+        final String credentials = Base64.getEncoder().encodeToString((getFedoraUser() + ":" + password)
+                .getBytes(StandardCharsets.UTF_8));
+        final HttpRequest request = HttpRequest.newBuilder(endpoint)
+                .timeout(Duration.ofMinutes(2))
+                .header("Authorization", "Basic " + credentials)
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build();
+        final HttpResponse<String> response = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(20)).build()
+                .send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        if (response.statusCode() >= 300) {
+            throw new DepositException("Fedora external relocation failed for " + fid + ", status "
+                    + response.statusCode() + ": " + response.body());
+        }
+        LOGGER.info("Relocated prior payload for resource [{}] from [{}] to [{}]", fid, canonical, archived);
+    }
 
-			String path = Saxon.xpath2string(Saxon.wrapNode(sip.getRecord()), xpathDSName, null, NAMESPACES);
-			if (path == null || path.isEmpty()) {
-				throw new DepositException("SIP Name is unknown!");
-			}
+    /**
+     * Fedora's existing external binary references use {@code file:/path},
+     * whereas {@link Path#toUri()} emits {@code file:///path}. Both designate
+     * the same POSIX file, but relocation deliberately uses an exact match to
+     * avoid rewriting an unexpected binary.
+     */
+    private static String fedoraFileUri(final Path path) {
+        return path.toUri().toString().replaceFirst("^file:///", "file:/");
+    }
 
-			path = StringUtils.stripAccents(path);
-			path = path.replaceAll("[^a-zA-Z0-9]", "_");
+    private static Path versionedPath(final Path canonical) {
+        final String suffix = VERSION_SUFFIX.format(Instant.now());
+        Path candidate = canonical.resolveSibling(canonical.getFileName() + "." + suffix);
+        for (int collision = 1; Files.exists(candidate, LinkOption.NOFOLLOW_LINKS); collision++) {
+            candidate = canonical.resolveSibling(canonical.getFileName() + "." + suffix + "." + collision);
+        }
+        return candidate;
+    }
 
-			path = getCollectionPath(sip) + "/" + path;
+    private static void move(final Path source, final Path target) throws IOException {
+        try {
+            Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException ex) {
+            Files.move(source, target);
+        }
+    }
 
-			path += "/";
-
-			// Replace the fedora path with file system path based on
-			// archive-roots-mapping.xml
-			XdmNode nArchRootMap = Saxon.buildDocument(new StreamSource(archRootMap));
-			XdmNode mapping = (XdmNode) Saxon.xpathSingle(nArchRootMap,"//mapping[starts-with('" + path + "',sanitized-fedora-path)][1]");
-			if (mapping != null) {
-				String fedoraPath = Saxon.xpath2string(mapping, "./sanitized-fedora-path");
-				String fileSysPath = Saxon.xpath2string(mapping, "./file-system-path");
-				logger.debug("Path: " + path);
-				logger.debug("The sanitized fedora path(archive-roots-mapping.xml): " + fedoraPath);
-				logger.debug("Path in file system(archive-roots-mapping.xml): " + fileSysPath);
-				path = path.replace(fedoraPath, fileSysPath);
-				logger.debug("Path after replacing: " + path);
-			} else {
-				throw new DepositException("FAILED! Path: " + path + " is not specified in archive-roots-mapping.xml file");
-			}
-
-			Path dirPath = Paths.get(path);
-			Iterator<Path> iPath = dirPath.iterator();
-			Path p = Paths.get("/");
-
-			for (Path part : dirPath) {
-				p = (p == null ? part : p.resolve(part));
-				if (!Files.exists(p)) {
-					try {
-						context.registerRollbackEvent(this, "mkdir", "dir", p.toString());
-						Files.createDirectory(p);
-						logger.debug("Directory created! " + p);
-					} catch (Exception ex) {
-						throw new DepositException("Creation of directories failed:" + ex.getMessage());
-
-					}
-				}
-			}
-
-			for (Resource res : sip.getResources()) {
-				if (res.isUpdate() || res.isInsert()) {
-					File file = res.getFile();
-
-					if (file == null) {
-						throw new DepositException("Unexpected status! No file found in resource");
-					}
-
-					String fileName = file.getName();
-					File target = new File(path + "/" + fileName);
-					while (target.exists()) {
-						if (res.isUpdate()) {
-							String df = new SimpleDateFormat("yyyy-MM-dd_hh-mm-ss").format(new Date());
-							File oldFile = new File(target.getPath());
-							String reName = oldFile.getPath() + "." + df;
-							File oldFileRename = new File(reName);
-
-							if (oldFile.renameTo(oldFileRename)) {
-								logger.debug("File renamed from " + oldFile + " to " + oldFileRename);
-
-								String fid = res.getFID(true).toString();
-								String dsid = "OBJ";
-								ModifyDatastreamResponse mdsResponse = null;
-
-								ModifyDatastream mds = modifyDatastream(fid, dsid);
-
-								mdsResponse = mds.versionable(false).execute();
-								if (mdsResponse.getStatus() != 200) {
-									throw new DepositException("Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
-								}
-
-								mdsResponse = mds.dsLocation("file:/" + oldFile.getPath()).logMessage("Updated " + dsid).execute();
-								if (mdsResponse.getStatus() != 200) {
-									throw new DepositException("Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
-								}
-
-								context.registerRollbackEvent(this, "updateLocation", "oldPath", oldFile.getPath(),"fid", fid, "dsid", dsid);
-
-								mdsResponse = mds.versionable(true).execute();
-								if (mdsResponse.getStatus() != 200) {
-									throw new DepositException("Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
-								}
-
-								logger.debug("Updated FedoraObject[" + fid + "][" + dsid + "]["+ mdsResponse.getLastModifiedDate() + "]");
-
-								// register the update of the PID for the old
-								// version of the resource
-								context.registerRollbackEvent(this, "addPID");
-								context.addPID(this.lookupPID(res.getFID(true)), new URI(fid + "#OBJ@" + Global.asOfDateTime(mdsResponse.getLastModifiedDate())));
-							} else {
-								throw new DepositException("FAILED! Failed to rename the resource with same name as new one while updating the resource!");
-							}
-						} else {
-							throw new DepositException("File path [" + target + "] clash for Resource[" + res.getFile()+ "] during update");
-						}
-					}
-
-					context.registerRollbackEvent(this, "move", "from", res.getFile().toPath().toString(), "to",target.toPath().toString());
-
-					Files.move(res.getFile().toPath(), target.toPath());
-					logger.debug("Moved file from :" + res.getFile().toPath() + " to: " + target.getPath());
-					res.setFile(target);
-				} else {
-					logger.debug("The res was neither for insert not for update. MPIPersist action did not perform on the res!- "+res.getFID().toString());
-				}
-			}
-
-		} catch (Exception ex) {
-			throw new DepositException("Couldn't persist the resources!", ex);
-		}
-		return true;
-	}
-
-	private String getCollectionPath(CMD sip) throws FedoraClientException, SaxonApiException, URISyntaxException, DepositException {
-		String path = "";
-		String pFid = null;
-		Set colls = sip.getCollections(false);
-		if (colls.size() > 1) {
-			throw new DepositException("MPI doesn't do more than one parent collection!");
-		} else if (!colls.isEmpty()) {
-			pFid = ((Collection) colls.iterator().next()).getFID(true).toString();
-		}
-		if (pFid != null) {
-			path = getCollectionPath(pFid) + "/" + getSanitizedCollectionLabel(pFid);
-		}
-		return path;
-	}
-
-	private String getCollectionPath(String fid) throws FedoraClientException, SaxonApiException, URISyntaxException, DepositException {
-		String path = "";
-		String sparql = "SELECT ?fid WHERE { <info:fedora/" + fid+ "> <info:fedora/fedora-system:def/relations-external#isMemberOfCollection> ?fid } ";
-		logger.debug("SPARQL[" + sparql + "]");
-		RiSearchResponse resp = riSearch(sparql).format("sparql").execute();
-		if (resp.getStatus() == 200) {
-			XdmNode tpl = Saxon.buildDocument(new StreamSource(resp.getEntityInputStream()));
-			logger.debug("RESULT[" + tpl.toString() + "]");
-			for (Iterator<XdmItem> iter = Saxon.xpathIterator(tpl,"normalize-space(//*:results/*:result/*:fid/@uri)"); iter.hasNext();) {
-				XdmItem n = iter.next();
-				String f = n.getStringValue();
-				if (f != null && !f.isEmpty()) {
-					String pFid = f.replace("info:fedora/", "").replaceAll("#.*", "");
-
-					path = getCollectionPath(pFid) + "/" + getSanitizedCollectionLabel(pFid);
-
-					if (iter.hasNext()) {
-						throw new DepositException("MPI doesn't do more than one parent collection!");
-					}
-					break; // get out of the loop
-				}
-			}
-		} else
-			throw new DepositException("Unexpected status[" + resp.getStatus() + "] while interacting with Fedora Commons!");
-		return path;
-	}
-
-	private String getSanitizedCollectionLabel(String fid) throws FedoraClientException, SaxonApiException, URISyntaxException, DepositException {
-		GetObjectProfileResponse res = getObjectProfile(fid).execute();
-		if (res.getStatus() != 200) {
-			throw new DepositException("Unexpected status[" + res.getStatus() + "] while interacting with Fedora Commons!");
-		}
-
-		String lbl = res.getLabel();
-		if (lbl == null || lbl.isEmpty()) {
-			throw new DepositException("Collection label is unknown!");
-		}
-
-		// remove diacritics from the lbl string
-		lbl = StringUtils.stripAccents(lbl);
-		lbl = lbl.replaceAll("[^a-zA-Z0-9]", "_");
-
-		return lbl;
-	}
-
-	public void rollback(Context context, List<XdmItem> events) {
-		if (events.size() > 0) {
-			ModifyDatastreamResponse mdsResponse = null;
-			String fid = null;
-			String dsid;
-			for (ListIterator<XdmItem> iter = events.listIterator(events.size()); iter.hasPrevious();) {
-				XdmItem event = iter.previous();
-				try {
-					String tpe = Saxon.xpath2string(event, "@type");
-					if (tpe.equals("move")) {
-						File from = new File(Saxon.xpath2string(event, "param[@name='from']/@value"));
-						File to = new File(Saxon.xpath2string(event, "param[@name='to']/@value"));
-						if (to.exists() && to.isFile() && to.canWrite() && !from.exists()) {
-							Files.move(to.toPath(), from.toPath());
-							logger.debug("rollback action[" + this.getName() + "] event[" + tpe + "] moved [" + to+ "] back to [" + from + "]");
-						} else {
-							logger.error("rollback action[" + this.getName() + "] event["+ Saxon.xpath2string(event, "@type") + "] failed source[" + from+ "] and destination[" + to + "] can't be restored!");
-						}
-					} else if (tpe.equals("mkdir")) {
-						File dir = new File(Saxon.xpath2string(event, "param[@name='dir']/@value"));
-						if (dir.list().length == 0) {
-							logger.info("Directory["+dir.toPath()+" is empty! (Safe to delete)");
-							if (Files.deleteIfExists(dir.toPath())) 
-								logger.debug("rollback action[" + this.getName() + "] event[" + tpe + "] removed dir[" + dir + "]");	
-							else 
-								logger.debug("But-- rollback action[" + this.getName() + "] event[" + tpe + "] did not remove dir[" + dir + "]");
-						}
-						else
-							logger.info("Directory["+dir.toPath()+" is not empty!!!");
-					} else if (tpe.equals("updateLocation")) {
-						File path = new File(Saxon.xpath2string(event, "param[@name='oldPath']/@value"));
-						fid = Saxon.xpath2string(event, "param[@name='fid']/@value");
-						dsid = Saxon.xpath2string(event, "param[@name='dsid']/@value");
-
-						ModifyDatastream mds = modifyDatastream(fid, dsid);
-						mdsResponse = mds.versionable(false).execute();
-						if (mdsResponse.getStatus() != 200)
-							throw new DepositException("Rollback:Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
-						mdsResponse = mds.dsLocation("file:/" + path.getPath()).logMessage("Rollback Updated " + dsid).execute();
-
-						if (mdsResponse.getStatus() != 200)
-							throw new DepositException("Rollback:Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
-
-						mdsResponse = mds.versionable(true).execute();
-						if (mdsResponse.getStatus() != 200)
-							throw new DepositException("Rollback:Unexpected status[" + mdsResponse.getStatus()+ "] while interacting with Fedora Commons!");
-
-						logger.debug("Rollback: Updated FedoraObject[" + fid + "][" + dsid + "]["+ mdsResponse.getLastModifiedDate() + "]");
-
-					} else if (tpe.equals("addPID")) {
-						URI fidURI = new URI(fid);
-						context.addPID(this.lookupPID(fidURI),new URI(fid + "#OBJ@" + Global.asOfDateTime(mdsResponse.getLastModifiedDate())));
-					} else {
-						logger.error("rollback action[" + this.getName() + "] rollback unknown event[" + tpe + "]!");
-					}
-				} catch (Exception ex) {
-					logger.error("rollback action[" + this.getName() + "] event[" + event + "] failed!", ex);
-				}
-			}
-		}
-	}
-
+    @Override
+    public void rollback(final Context context, final List<XdmItem> events) {
+        for (int index = events.size() - 1; index >= 0; index--) {
+            try {
+                final XdmItem event = events.get(index);
+                if (!"insert-move".equals(nl.mpi.tla.util.Saxon.xpath2string(event, "@type"))) {
+                    continue;
+                }
+                final Path source = Path.of(nl.mpi.tla.util.Saxon.xpath2string(event, "param[@name='src']/@value"));
+                final Path target = Path.of(nl.mpi.tla.util.Saxon.xpath2string(event, "param[@name='dst']/@value"));
+                if (Files.exists(source, LinkOption.NOFOLLOW_LINKS) && !Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+                    move(source, target);
+                }
+            } catch (Exception ex) {
+                LOGGER.error("Could not roll back hybrid persist event", ex);
+            }
+        }
+    }
 }
