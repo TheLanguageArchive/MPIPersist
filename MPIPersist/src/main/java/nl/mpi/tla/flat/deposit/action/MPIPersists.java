@@ -20,27 +20,31 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.text.Normalizer;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Base64;
+import java.util.EnumSet;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
+import java.nio.file.attribute.PosixFilePermission;
 import javax.xml.transform.stream.StreamSource;
 import net.sf.saxon.s9api.SaxonApiException;
 import net.sf.saxon.s9api.XdmItem;
+import net.sf.saxon.s9api.XdmNode;
+import net.sf.saxon.s9api.XdmValue;
 import nl.mpi.tla.flat.deposit.Context;
 import nl.mpi.tla.flat.deposit.DepositException;
-import nl.mpi.tla.flat.deposit.action.persist.util.PersistDatasetNameRetriever;
-import nl.mpi.tla.flat.deposit.action.persist.util.PersistencePolicies;
-import nl.mpi.tla.flat.deposit.action.persist.util.PersistencePolicy;
-import nl.mpi.tla.flat.deposit.action.persist.util.PersistencePolicyLoader;
-import nl.mpi.tla.flat.deposit.action.persist.util.PersistencePolicyMatcher;
+import nl.mpi.tla.flat.deposit.sip.Collection;
 import nl.mpi.tla.flat.deposit.sip.Resource;
 import nl.mpi.tla.flat.deposit.sip.SIPInterface;
+import nl.mpi.tla.flat.deposit.util.Global;
+import nl.mpi.tla.util.Saxon;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -62,30 +66,243 @@ public class MPIPersists extends FedoraAction {
     @Override
     public boolean perform(final Context context) throws DepositException {
         connect(context);
-        final String resourcesDir = getParameter("resourcesDir", null);
-        final String policyFile = getParameter("policyFile", null);
         final SIPInterface sip = context.getSIP();
-        final PersistencePolicies policies;
+        // Check all payloads before moving any file. A stale classification
+        // must fail before another resource's archive version is relocated.
+        for (final Resource resource : sip.getResources()) {
+            if ((resource.isInsert() || resource.isUpdate()) && !resource.hasFile()) {
+                throw new DepositException("Resource[" + resource.getURI() + "] is marked "
+                        + resource.getStatus() + " but has no local payload; validate the SIP again "
+                        + "so retained archive references are classified as NOOP");
+            }
+        }
+        final Set<PosixFilePermission> filePermissions = parseFileMode(getParameter("fileMode", ""));
+        final Path archiveRoot = Path.of(getParameter("archiveRoot")).toAbsolutePath().normalize();
+        final Path datasetDirectory;
         try {
-            final String datasetName = new PersistDatasetNameRetriever()
-                    .getDatasetName(sip.getRecord(), getParameter("xpathDatasetName"));
-            policies = new PersistencePolicyLoader(new File(resourcesDir))
-                    .loadPersistencePolicies(new StreamSource(policyFile), sip, datasetName);
-        } catch (SaxonApiException | IllegalStateException ex) {
-            throw new DepositException("Error loading persistence policy '" + policyFile + "'", ex);
+            final String requestedDatasetName = context.getProperty("bundleName", "")
+                    .itemAt(0).getStringValue();
+            final String datasetName = datasetName(Saxon.wrapNode(sip.getRecord()),
+                    requestedDatasetName, getParameter("xpathDatasetName"));
+            if (datasetName == null || datasetName.isBlank()) {
+                throw new DepositException("SIP name is unknown");
+            }
+            final String fedoraPath = collectionPath(sip) + "/" + sanitizePathComponent(datasetName) + "/";
+            datasetDirectory = applyArchiveRootMapping(
+                    new File(getParameter("archiveRootMapping")), fedoraPath).toAbsolutePath().normalize();
+            if (!datasetDirectory.startsWith(archiveRoot)) {
+                throw new DepositException("Archive root mapping resolved outside archiveRoot: "
+                        + datasetDirectory + " (expected below " + archiveRoot + ")");
+            }
+            LOGGER.info("Resolved archive path [{}] to [{}]", fedoraPath, datasetDirectory);
+        } catch (DepositException ex) {
+            throw ex;
+        } catch (Exception ex) {
+            throw new DepositException("Couldn't determine the archive dataset path", ex);
         }
 
         for (final Resource resource : sip.getResources()) {
             if (!resource.isInsert() && !resource.isUpdate()) {
                 continue;
             }
-            final PersistencePolicy policy = new PersistencePolicyMatcher(policies).matchPersistencePolicy(resource);
-            persist(context, resource, policy.getTarget().toPath().resolve(resource.getFile().getName()));
+            persist(context, resource, datasetDirectory.resolve(resource.getFile().getName()), filePermissions);
         }
         return true;
     }
 
-    private void persist(final Context context, final Resource resource, final Path canonical) throws DepositException {
+    static String datasetName(final XdmNode record, final String requestedName,
+                              final String fallbackXPath) throws Exception {
+        if (requestedName != null && !requestedName.isBlank()) {
+            return requestedName.trim();
+        }
+        return Saxon.xpath2string(record, fallbackXPath, null, Global.NAMESPACES);
+    }
+
+    /** Recreate the Fedora 3 archive layout from the hierarchy loaded into the SIP. */
+    private String collectionPath(final SIPInterface sip) throws DepositException {
+        final Set<Collection> collections = sip.getCollections(false);
+        if (collections.size() > 1) {
+            throw new DepositException("MPI doesn't support more than one parent collection");
+        }
+        if (collections.isEmpty()) {
+            return "";
+        }
+        final StringBuilder path = new StringBuilder();
+        appendCollectionPath(collections.iterator().next(), path, new HashSet<>());
+        return path.toString();
+    }
+
+    private void appendCollectionPath(final Collection collection, final StringBuilder path,
+                                      final Set<String> visited) throws DepositException {
+        final String fid = collection.getFID(true).toString();
+        if (!visited.add(fid)) {
+            throw new DepositException("Cycle in collection hierarchy at " + fid);
+        }
+        final Set<Collection> parents = collection.getParentCollections(false);
+        if (parents.size() > 1) {
+            throw new DepositException("MPI doesn't support more than one parent collection for " + fid);
+        }
+        if (!parents.isEmpty()) {
+            appendCollectionPath(parents.iterator().next(), path, visited);
+        } else {
+            // FedoraLoadCollectionHierarchy deliberately stops above the
+            // highest parent that has CMD, because other actions may update
+            // every collection held in the SIP. Read any remaining structural
+            // ancestors directly for this path only; never add them to the SIP.
+            appendStructuralAncestors(collection.getFID(true), path, visited);
+        }
+        path.append('/').append(sanitizePathComponent(collectionLabel(collection)));
+    }
+
+    private void appendStructuralAncestors(final URI child, final StringBuilder path,
+                                           final Set<String> visited) throws DepositException {
+        final Set<URI> parents = repositoryParents(child);
+        if (parents.size() > 1) {
+            throw new DepositException("MPI doesn't support more than one parent collection for " + child);
+        }
+        if (parents.isEmpty()) {
+            return;
+        }
+        final URI parent = parents.iterator().next();
+        if (!visited.add(parent.toString())) {
+            throw new DepositException("Cycle in collection hierarchy at " + parent);
+        }
+        appendStructuralAncestors(parent, path, visited);
+        path.append('/').append(sanitizePathComponent(collectionLabel(parent)));
+    }
+
+    private Set<URI> repositoryParents(final URI child) throws DepositException {
+        try {
+            final String localBase = fedoraConfig.getString("localBase");
+            final String localServer = fedoraConfig.getString("localServer");
+            final String query = "SELECT ?fid WHERE { <" + localBase + "/" + child
+                    + "> <info:fedora/fedora-system:def/relations-external#isMemberOfCollection> ?fid }";
+            final XdmNode result = sparql(query);
+            if (result == null) {
+                throw new DepositException("No result while querying the triple store for parents of " + child);
+            }
+            final Set<URI> parents = new HashSet<>();
+            for (final XdmItem item : Saxon.xpath(result,
+                    "//srx:results/srx:result/srx:binding[@name='fid']/*"
+                            + "[self::srx:uri or self::srx:literal]",
+                    null, Global.NAMESPACES)) {
+                final String value = item.getStringValue();
+                if (value != null && !value.isBlank()) {
+                    parents.add(FedoraLoadCollectionHierarchy.normalizeCollectionFID(
+                            value, localBase, localServer));
+                }
+            }
+            return parents;
+        } catch (DepositException ex) {
+            throw ex;
+        } catch (Exception ex) {
+            throw new DepositException("Couldn't load structural parents for " + child, ex);
+        }
+    }
+
+    /** Use the Fedora 3 object label preserved by migration, with DC as fallback. */
+    private String collectionLabel(final Collection collection) throws DepositException {
+        return collectionLabel(collection.getFID(true));
+    }
+
+    private String collectionLabel(final URI fid) throws DepositException {
+        try {
+            final XdmNode description = fcrepo(fid);
+            String label = preservedObjectLabel(description);
+            if (label == null || label.isBlank()) {
+                final XdmNode dc = getXMLDataStream(fid, "DC");
+                label = firstDublinCoreTitle(dc);
+                if (label == null || label.isBlank()) {
+                    label = firstDublinCoreTitle(description);
+                }
+            }
+            if (label == null || label.isBlank()) {
+                throw new DepositException("Collection label is unknown for " + fid);
+            }
+            return label;
+        } catch (DepositException ex) {
+            throw ex;
+        } catch (Exception ex) {
+            throw new DepositException("Couldn't retrieve the collection label for " + fid, ex);
+        }
+    }
+
+    static String preservedObjectLabel(final XdmNode description) throws Exception {
+        return description == null ? null : Saxon.xpath2string(description,
+                "normalize-space((//*[namespace-uri() = "
+                        + "'info:fedora/fedora-system:def/model#' "
+                        + "and local-name() = 'label'])[1])");
+    }
+
+    static String firstDublinCoreTitle(final XdmNode document) throws Exception {
+        return document == null ? null : Saxon.xpath2string(document,
+                "normalize-space((//dc:title)[1])", null, Global.NAMESPACES);
+    }
+
+    static String sanitizePathComponent(final String value) throws DepositException {
+        final String sanitized = Normalizer.normalize(value.trim(), Normalizer.Form.NFD)
+                .replaceAll("\\p{M}+", "")
+                .replaceAll("[^a-zA-Z0-9]", "_");
+        if (sanitized.isEmpty()) {
+            throw new DepositException("Archive path component is empty after sanitization");
+        }
+        return sanitized;
+    }
+
+    static Path applyArchiveRootMapping(final File mappingFile, final String fedoraPath)
+            throws DepositException {
+        if (!mappingFile.isFile() || !mappingFile.canRead()) {
+            throw new DepositException("Archive root mapping isn't a readable file: " + mappingFile);
+        }
+        try {
+            final XdmNode mappings = Saxon.buildDocument(new StreamSource(mappingFile));
+            final XdmValue entries = Saxon.xpath(mappings, "/archive-roots-mapping/mapping");
+            for (final XdmItem entry : entries) {
+                final String source = Saxon.xpath2string(entry,
+                        "normalize-space(sanitized-fedora-path)");
+                final String target = Saxon.xpath2string(entry,
+                        "normalize-space(file-system-path)");
+                if (source != null && !source.isEmpty() && fedoraPath.startsWith(source)) {
+                    final Path targetRoot = Path.of(target);
+                    return targetRoot.resolve(fedoraPath.substring(source.length())).normalize();
+                }
+            }
+        } catch (SaxonApiException | IllegalArgumentException ex) {
+            throw new DepositException("Couldn't read archive root mapping " + mappingFile, ex);
+        }
+        throw new DepositException("Path isn't specified in archive-roots-mapping.xml: " + fedoraPath);
+    }
+
+    private static Set<PosixFilePermission> parseFileMode(final String value) throws DepositException {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        final String mode = value.trim();
+        if (!mode.matches("0?[0-7]{3}")) {
+            throw new DepositException("Invalid MPIPersist fileMode[" + value + "]; use an octal mode such as 0640");
+        }
+        final int bits;
+        try {
+            bits = Integer.parseInt(mode, 8);
+        } catch (NumberFormatException ex) {
+            throw new DepositException("Invalid MPIPersist fileMode[" + value + "]; use an octal mode such as 0640", ex);
+        }
+        final PosixFilePermission[] permissions = {
+            PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE,
+            PosixFilePermission.GROUP_READ, PosixFilePermission.GROUP_WRITE, PosixFilePermission.GROUP_EXECUTE,
+            PosixFilePermission.OTHERS_READ, PosixFilePermission.OTHERS_WRITE, PosixFilePermission.OTHERS_EXECUTE,
+        };
+        final EnumSet<PosixFilePermission> result = EnumSet.noneOf(PosixFilePermission.class);
+        for (int index = 0; index < permissions.length; index++) {
+            if ((bits & (1 << (8 - index))) != 0) {
+                result.add(permissions[index]);
+            }
+        }
+        return result;
+    }
+
+    private void persist(final Context context, final Resource resource, final Path canonical,
+                         final Set<PosixFilePermission> filePermissions) throws DepositException {
         final Path source = resource.getFile().toPath();
         try {
             Files.createDirectories(canonical.getParent());
@@ -102,6 +319,9 @@ public class MPIPersists extends FedoraAction {
                     throw new DepositException("Updated resource has no regular current payload at " + canonical);
                 }
                 resumeUpdate(resource, source, canonical);
+            }
+            if (filePermissions != null) {
+                Files.setPosixFilePermissions(canonical, filePermissions);
             }
             resource.setFile(canonical.toFile());
             LOGGER.info("Persisted resource [{}] at current path [{}]", source, canonical);
