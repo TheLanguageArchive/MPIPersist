@@ -76,6 +76,19 @@ public class MPIPersists extends FedoraAction {
                         + "so retained archive references are classified as NOOP");
             }
         }
+        // A SIP without new or updated payloads, such as a collection, has
+        // nothing to move; the archive path and its mapping are not needed.
+        boolean hasPayloadToPersist = false;
+        for (final Resource resource : sip.getResources()) {
+            if (resource.isInsert() || resource.isUpdate()) {
+                hasPayloadToPersist = true;
+                break;
+            }
+        }
+        if (!hasPayloadToPersist) {
+            LOGGER.info("No resources to persist; archive root mapping not consulted");
+            return true;
+        }
         final Set<PosixFilePermission> filePermissions = parseFileMode(getParameter("fileMode", ""));
         final Path archiveRoot = Path.of(getParameter("archiveRoot")).toAbsolutePath().normalize();
         final Path datasetDirectory;
