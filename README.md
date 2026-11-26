@@ -9,6 +9,20 @@ Place `MPIPersist-2.0-SNAPSHOT.jar` in the DoorKeeper application classpath.
 
 ## Payload layout
 
+MPIPersist recreates the Fedora 3 archive layout on Fedora 7. It walks the
+single-parent collection hierarchy loaded by DoorKeeper, reads each
+collection's first Dublin Core title, sanitizes every collection title and the
+CMDI dataset name, and constructs this logical path:
+
+```
+/Collection/Child_collection/Bundle_name/
+```
+
+The first matching prefix in `archive-roots-mapping.xml` rewrites that logical
+path to its archive filesystem path. All mapped paths must remain below the
+configured `archiveRoot`; they do not have to remain below one particular
+`archive-data` directory.
+
 MPIPersist 2 keeps the current payload at its existing, unsuffixed regular
 filename. On update, the Fedora external-relocation extension atomically moves
 the previous current file to a timestamped sibling and rewrites the existing
@@ -37,18 +51,42 @@ The standard persist action configuration in flat-deposit.xml needs to be replac
 ```
 <action name="persist resources" class="nl.mpi.tla.flat.deposit.action.MPIPersists">
 <parameter name="fedoraConfig" value="{$base}/policies/fedora-config.xml"/>
-<parameter name="xpathDatasetName" value="/cmd:CMD[cmd:Header/cmd:MdProfile='clarin.eu:cr1:p_1345561703683']/cmd:Components/cmd:ComicBook/cmd:Title"/>
+<parameter name="archiveRoot" value="/mnt/vfs1/archive"/>
+<parameter name="xpathDatasetName" value="((/cmd:CMD/cmd:Components/*/cmd:Name | /cmd:CMD/cmd:Components/*/cmd:Title)[normalize-space(.)])[1]"/>
 <parameter name="archiveRootMapping" value="{$base}/policies/archive-roots-mapping.xml"/>
 </action>
 ```
 
-The MPIDelete action configuration in flat-deposit.xml needs to be placed with following lines before the action FedoraDelete (adapted for your local paths and CMDI profiles):
-```
-<action class="nl.mpi.tla.flat.deposit.action.MPIDelete">
-	<parameter name="fedoraConfig" value="{$work}/acl/fedora-config.xml"/>
+For the bundle-detachment workflow, run `MPIDelete` immediately after
+`commitTransaction` and before `FedoraVersioning` / Drupal sync:
+
+```xml
+<action name="mark removed payloads deleted" class="nl.mpi.tla.flat.deposit.action.MPIDelete">
+    <parameter name="fedoraConfig" value="{$base}/policies/fedora-config.xml"/>
+    <parameter name="detachedResources" value="true"/>
+    <parameter name="journalDir" value="{$work}/metadata/deleted-payloads"/>
 </action>
 ```
 
-MPIDelete uses the same Fedora relocation extension to move the regular
-current file to `.Deleted.<timestamp>` and rebuild the OCFL version. It does
-not use links or copy payload bytes.
+`FedoraDetachResources` must run inside the transaction before CMDI is
+replaced. It saves the stable omitted FIDs in `metadata/detached-resources.json`
+and republishes them in context memory on retries. `MPIDelete` consumes that
+intent after commit; querying the bundle's former relationships would miss
+the files once detachment has committed.
+
+Only a removed file with no remaining `isConstituentOf` membership is renamed.
+Shared files retain their current filenames. New bundles and updates with no
+removals are no-ops. The Fedora object, OBJ binary, Handles and selected access
+policy remain available; this workflow does not require `FedoraDelete`.
+
+MPIDelete uses Fedora's external relocation extension to move the regular
+current file to `.Deleted.<UTC timestamp>` and rebuild the OCFL version. It
+uses no links or payload copies. The SIP's deletion journal records the exact
+source, destination and operation ID before requesting relocation, so a retry
+can resume even after the original file has moved. Keep these journals with
+the SIP until processing completes.
+
+Existing legacy workflows may omit `detachedResources`; in that mode
+`MPIDelete` retains its relationship-query discovery and can precede the
+legacy `FedoraDelete` action. Do not use that discovery mode after resource
+detachment.
